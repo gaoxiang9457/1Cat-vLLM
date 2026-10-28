@@ -1,0 +1,93 @@
+name: qoder-build-sm70-wheels
+# 复刻上游 .buildkite/release-pipeline.yaml 的 "Build wheel - x86_64 - CUDA 12.8 - SM70" 作业：
+#   CUDA_VERSION=12.8.1 / torch_cuda_arch_list="7.0" / BUILD_OS=manylinux
+#   BUILD_BASE_IMAGE=pytorch/manylinux2_28-builder:cuda12.8 / --target build
+# 只改两处：max_jobs 16→4（GitHub 公共 runner 只有 4 核）、去掉 USE_SCCACHE（需要外部 R2 桶）。
+# 产物用上游自己的 tools/check_sm70_release_artifact.py 验收后才发 Release。
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: branch/sha to build
+        default: main
+        required: false
+      max_jobs:
+        description: build-arg max_jobs
+        default: "4"
+        required: false
+concurrency:
+  group: qoder-sm70-wheel
+  cancel-in-progress: false
+permissions:
+  contents: write
+jobs:
+  wheel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+          fetch-depth: 0
+
+      - name: 00 free runner disk (measured, not assumed)
+        run: |
+          df -h / "$RUNNER_TEMP" || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/dotnet ~/.nuget /usr/lib/firefox* /usr/share/selenium \
+                      "$IMAGE_FOLDER" 2>/dev/null || true
+          sudo apt-get purge -y azure-cli '^microsoft-edge-*' powershell ffmpeg >/dev/null 2>&1 || true
+          sudo apt-get autoremove -y >/dev/null 2>&1 || true
+          sudo docker system prune -af >/dev/null 2>&1 || true
+          df -h / "$RUNNER_TEMP"
+          free_g=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          echo "free on / = ${free_g} GB ; build needs >=12 GB"
+          test "$free_g" -ge 12 || { echo "::error::insufficient disk (${free_g} GB) — aborting before the 8 GB base image pull"; exit 1; }
+
+      - name: 01 pull the manylinux CUDA 12.8 builder
+        run: |
+          time docker pull pytorch/manylinux2_28-builder:cuda12.8
+          df -h / | tail -1
+
+      - name: 02 build wheel (--target build, sm_70 only)
+        run: |
+          DOCKER_BUILDKIT=1 docker build \
+            --build-arg max_jobs="${{ inputs.max_jobs || '4' }}" \
+            --build-arg nvcc_threads=2 \
+            --build-arg GIT_REPO_CHECK=0 \
+            --build-arg CUDA_VERSION=12.8.1 \
+            --build-arg torch_cuda_arch_list="7.0" \
+            --build-arg BUILD_OS=manylinux \
+            --build-arg BUILD_BASE_IMAGE=pytorch/manylinux2_28-builder:cuda12.8 \
+            --progress plain \
+            --target build \
+            -t qoder-sm70:build \
+            -f docker/Dockerfile . 2>&1 | tee /tmp/build.log
+        env:
+          DOCKER_BUILDKIT: "1"
+
+      - name: "03 gate: upstream SM70 artifact checker"
+        run: |
+          mkdir -p artifacts
+          docker run --rm -v "$(pwd)/artifacts:/artifacts_host" qoder-sm70:build \
+            bash -c 'python3 tools/check_sm70_release_artifact.py dist/*.whl && cp -r dist/* /artifacts_host/ && chmod -R a+rw /artifacts_host'
+          ls -la artifacts
+          sha256sum artifacts/*.whl | tee artifacts/SHA256SUMS
+
+      - name: "04 publish to Release (public assets are unmetered)"
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(git rev-parse --short HEAD)
+          tag="sm70-qoder-$sha-$(date -u +%Y%m%d)"
+          gh release create "$tag" artifacts/*.whl artifacts/SHA256SUMS \
+            --target "$(git rev-parse HEAD)" \
+            --title "SM70 wheel built on $tag" \
+            --notes "Built by workflow ${{ github.run_id }} from $sha (sm_70 only, CUDA 12.8.1, max_jobs=${{ inputs.max_jobs || '4' }}). Passed tools/check_sm70_release_artifact.py."
+
+      - name: 99 diagnosis on failure
+        if: failure()
+        run: |
+          df -h / | tail -2
+          tail -60 /tmp/build.log || true
